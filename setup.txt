@@ -1,0 +1,972 @@
+{
+  [ "temp/pastebin/upload.lua" ] = "-- Pastebin Configuration using the official mod key\r\
+local API_DEV_KEY = \"v1mO2INEooS603Tl4hruLtmhUSaCEHlk\"\r\
+\r\
+local args = { ... }\r\
+local filename = args[1]\r\
+\r\
+if not filename then\r\
+    print(\"Usage: upload [filename]\")\r\
+    return\r\
+end\r\
+\r\
+if not fs.exists(filename) then\r\
+    print(\"Error: File not found.\")\r\
+    return\r\
+end\r\
+\r\
+-- Read target file\r\
+local file = fs.open(filename, \"r\")\r\
+local content = file.readAll()\r\
+file.close()\r\
+\r\
+print(\"Connecting to pastebin.com... \")\r\
+\r\
+-- Correct payload format from the official CC source code\r\
+local uploadPayload = \"api_option=paste&\" ..\r\
+                      \"api_dev_key=\" .. API_DEV_KEY .. \"&\" ..\r\
+                      \"api_paste_format=lua&\" ..\r\
+                      \"api_paste_name=\" .. textutils.urlEncode(filename) .. \"&\" ..\r\
+                      \"api_paste_code=\" .. textutils.urlEncode(content)\r\
+\r\
+local response, err = http.post(\"https://pastebin.com/api/api_post.php\", uploadPayload)\r\
+\r\
+if response then\r\
+    local resultUrl = response.readAll()\r\
+    response.close()\r\
+    \r\
+    if resultUrl:match(\"https://pastebin.com\") then\r\
+        print(\"Success!\")\r\
+        print(\"Link: \" .. resultUrl)\r\
+    else\r\
+        print(\"Upload failed: \" .. resultUrl)\r\
+    end\r\
+else\r\
+    print(\"Failed.\")\r\
+    if err then print(\"Reason: \" .. tostring(err)) end\r\
+end\r\
+",
+  [ "temp/commander.lua" ] = "local w, h = term.getSize()\r\
+-- Store current paths and file lists for both panels\r\
+local leftDir, rightDir = \"\", \"\" -- \"\", \"\"\r\
+local leftFiles = fs.list(leftDir)\r\
+local rightFiles = fs.list(rightDir)\r\
+\r\
+local activePanel = \"left\"\r\
+local leftSel, rightSel = 1, 1\r\
+local leftOffset, rightOffset = 0, 0\r\
+local leftScrollX, rightScrollX = 0, 0\r\
+local showHelp = false\r\
+-- Group selection tables\r\
+local leftSelected, rightSelected = {}, {}\r\
+\r\
+local function clearSelection(panel)\r\
+    if panel == \"left\" then leftSelected = {} else rightSelected = {} end\r\
+end\r\
+\r\
+local function getSelectedCount(selectedTable)\r\
+    local count = 0\r\
+    for _ in pairs(selectedTable) do count = count + 1 end\r\
+    return count\r\
+end\r\
+\r\
+-- Sorting function: folders at the top, then alphabetical order.\r\
+local function sortFiles(fileList, currentDir)\r\
+    table.sort(fileList, function(a, b)\r\
+        local pathA = fs.combine(currentDir, a)\r\
+        local pathB = fs.combine(currentDir, b)\r\
+        local isDirA = fs.isDir(pathA)\r\
+        local isDirB = fs.isDir(pathB)\r\
+        if isDirA ~= isDirB then\r\
+            return isDirA\r\
+        end\r\
+        return string.lower(a) < string.lower(b)\r\
+    end)\r\
+end\r\
+\r\
+local function refreshPanel(panel)\r\
+    if panel == \"left\" then\r\
+        leftFiles = fs.list(leftDir)\r\
+        sortFiles(leftFiles, leftDir)\r\
+        if leftSel > #leftFiles then leftSel = math.max(1, #leftFiles) end\r\
+    else\r\
+        rightFiles = fs.list(rightDir)\r\
+        sortFiles(rightFiles, rightDir)\r\
+        if rightSel > #rightFiles then rightSel = math.max(1, #rightFiles) end\r\
+    end\r\
+end\r\
+\r\
+-- Clear event buffer before processing custom input loop\r\
+local function clearEvent()\r\
+    os.queueEvent(\"dummy\")\r\
+    while true do\r\
+        local e = os.pullEvent()\r\
+        if e == \"dummy\" then break end\r\
+    end\r\
+end\r\
+\r\
+-- Popup prompt window for text input (File/Folder name)\r\
+local function promptInput(title)\r\
+	local winW, winH = 30, 5\r\
+    local sx = math.floor((w - winW) / 2)\r\
+    local sy = math.floor((h - winH) / 2)\r\
+    \r\
+    -- Draw the background window frame\r\
+    term.setBackgroundColor(colors.gray)\r\
+    for y = sy, sy + winH - 1 do\r\
+        term.setCursorPos(sx, y)\r\
+        term.write(string.rep(\" \", winW))\r\
+    end\r\
+    \r\
+    term.setTextColor(colors.yellow)\r\
+    term.setCursorPos(sx + 2, sy + 1)\r\
+    term.write(title)\r\
+    \r\
+    -- Draw the input area background\r\
+    local fieldX = sx + 2\r\
+    local fieldY = sy + 3\r\
+    local fieldW = winW - 4 -- Visible width of the input box (26 characters)\r\
+    \r\
+    term.setBackgroundColor(colors.black)\r\
+    term.setTextColor(colors.white)\r\
+    term.setCursorPos(fieldX, fieldY)\r\
+    term.write(string.rep(\" \", fieldW))\r\
+    \r\
+	clearEvent()\r\
+    \r\
+    -- Initialize input string variables\r\
+    local inputStr = \"\"\r\
+    \r\
+    -- Internal function to redraw only the text field with scrolling logic\r\
+    local function renderField()\r\
+        term.setBackgroundColor(colors.black)\r\
+        term.setTextColor(colors.white)\r\
+        term.setCursorPos(fieldX, fieldY)\r\
+        term.write(string.rep(\" \", fieldW)) -- Clear box text\r\
+        \r\
+        -- Calculate scrolling window view offset\r\
+        local displayStr = inputStr\r\
+        if #inputStr > fieldW then\r\
+            displayStr = inputStr:sub(#inputStr - fieldW + 1)\r\
+        end\r\
+        \r\
+        term.setCursorPos(fieldX, fieldY)\r\
+        term.write(displayStr)\r\
+        \r\
+        -- Move the active blinking cursor to the end of the text line\r\
+        local cursorOffset = math.min(#inputStr, fieldW)\r\
+        term.setCursorPos(fieldX + cursorOffset, fieldY)\r\
+        term.setCursorBlink(true)\r\
+    end\r\
+    \r\
+    -- Custom input listener loop\r\
+    while true do\r\
+        renderField()\r\
+        local event, p1 = os.pullEvent()\r\
+        \r\
+        if event == \"char\" then\r\
+            -- Append normal text characters typed by user\r\
+            inputStr = inputStr .. p1\r\
+        elseif event == \"key\" then\r\
+            if p1 == keys.backspace then\r\
+                -- Remove last character\r\
+                if #inputStr > 0 then\r\
+                    inputStr = inputStr:sub(1, #inputStr - 1)\r\
+                end\r\
+            elseif p1 == keys.enter then\r\
+                -- Confirm input value\r\
+                term.setCursorBlink(false)\r\
+                --return (inputStr ~= \"\") and inputStr or path\r\
+				return (inputStr ~= \"\") and inputStr or nil\r\
+            elseif p1 == keys.layerUnknown or p1 == keys.esc then \r\
+                -- Cancel action on ESC key press\r\
+                term.setCursorBlink(false)\r\
+                return nil\r\
+            end\r\
+        end\r\
+    end\r\
+end\r\
+\r\
+-- #1\r\
+-- if event == \"char\" then\r\
+	-- if p1 then\r\
+		-- local charStr = tostring(p1)\r\
+		-- local leftPart = inputStr:sub(1, cursorPos)\r\
+		-- local rightPart = inputStr:sub(cursorPos + 1)\r\
+		-- inputStr = leftPart .. charStr .. rightPart\r\
+		-- cursorPos = cursorPos + #charStr\r\
+	-- end\r\
+-- Popup prompt window with cursor navigation, editing and scrolling\r\
+local function promptInputPath(title, path)\r\
+    local winW, winH = 30, 5\r\
+    local sx = math.floor((w - winW) / 2)\r\
+    local sy = math.floor((h - winH) / 2)\r\
+    \r\
+    -- Draw the background window frame\r\
+    term.setBackgroundColor(colors.gray)\r\
+    for y = sy, sy + winH - 1 do\r\
+        term.setCursorPos(sx, y)\r\
+        term.write(string.rep(\" \", winW))\r\
+    end\r\
+    \r\
+    term.setTextColor(colors.yellow)\r\
+    term.setCursorPos(sx + 2, sy + 1)\r\
+    term.write(title)\r\
+    \r\
+    -- Text field bounds\r\
+    local fieldX = sx + 2\r\
+    local fieldY = sy + 3\r\
+    local fieldW = winW - 4 -- 26 characters visible\r\
+    \r\
+    -- Clear event buffer from the triggering key press\r\
+    clearEvent()\r\
+    \r\
+    -- Input state variables\r\
+    local inputStr = path or \"\"\r\
+    local cursorPos = #inputStr -- Cursor is at the end of the text initially\r\
+    local scrollOffset = 0      -- Scrolling viewport position\r\
+    \r\
+    -- Internal function to redraw text field and calculate accurate scrolling\r\
+    local function renderField()\r\
+        term.setBackgroundColor(colors.black)\r\
+        term.setTextColor(colors.white)\r\
+        term.setCursorPos(fieldX, fieldY)\r\
+        term.write(string.rep(\" \", fieldW)) -- Clear input background\r\
+        -- Adjust scroll offset so the cursor is always visible on screen\r\
+        if cursorPos < scrollOffset then\r\
+            scrollOffset = cursorPos\r\
+        elseif cursorPos > scrollOffset + fieldW then\r\
+            scrollOffset = cursorPos - fieldW\r\
+        end\r\
+        -- Clamp scrolling if text gets shortened\r\
+        if #inputStr - scrollOffset < fieldW then\r\
+            scrollOffset = math.max(0, #inputStr - fieldW)\r\
+        end\r\
+        -- Get the visible slice of text and draw it\r\
+        local displayStr = inputStr:sub(scrollOffset + 1, scrollOffset + fieldW)\r\
+        term.setCursorPos(fieldX, fieldY)\r\
+        term.write(displayStr)\r\
+        -- Place the blinking hardware cursor at the relative position\r\
+        local relativeCursorX = cursorPos - scrollOffset\r\
+        term.setCursorPos(fieldX + relativeCursorX, fieldY)\r\
+        term.setCursorBlink(true)\r\
+    end\r\
+    \r\
+    -- Input listener loop\r\
+    while true do\r\
+        renderField()\r\
+        local event, p1 = os.pullEvent()\r\
+        -- if p1 then -> attempt to concatenate a nil value #1\r\
+        if event == \"char\" then\r\
+            -- INSERT character at current cursor position\r\
+            local leftPart = inputStr:sub(1, cursorPos)\r\
+            local rightPart = inputStr:sub(cursorPos + 1)\r\
+            inputStr = leftPart .. p1 .. rightPart\r\
+            cursorPos = cursorPos + 1 -- Move cursor right\r\
+            --inputStr = inputStr .. p1\r\
+        elseif event == \"key\" then\r\
+            if p1 == keys.backspace then\r\
+                -- DELETE character BEFORE cursor\r\
+                if cursorPos > 0 then\r\
+                    local leftPart = inputStr:sub(1, cursorPos - 1)\r\
+                    local rightPart = inputStr:sub(cursorPos + 1)\r\
+                    inputStr = leftPart .. rightPart\r\
+                    cursorPos = cursorPos - 1\r\
+                end\r\
+            elseif p1 == keys.delete then\r\
+                -- DELETE character AFTER cursor\r\
+                if cursorPos < #inputStr then\r\
+                    local leftPart = inputStr:sub(1, cursorPos)\r\
+                    local rightPart = inputStr:sub(cursorPos + 2)\r\
+                    inputStr = leftPart .. rightPart\r\
+                end\r\
+            elseif p1 == keys.left then\r\
+                -- Move cursor LEFT\r\
+                if cursorPos > 0 then\r\
+                    cursorPos = cursorPos - 1\r\
+                end\r\
+            elseif p1 == keys.right then\r\
+                -- Move cursor RIGHT\r\
+                if cursorPos < #inputStr then\r\
+                    cursorPos = cursorPos + 1\r\
+                end\r\
+            elseif p1 == keys.home then\r\
+                -- Jump to BEGINNING\r\
+                cursorPos = 0\r\
+            elseif p1 == keys.idAndTag or p1 == keys[\"end\"] then\r\
+                -- Jump to END\r\
+                cursorPos = #inputStr\r\
+            elseif p1 == keys.enter then\r\
+                -- Confirm and return\r\
+                term.setCursorBlink(false)\r\
+                return (inputStr ~= \"\") and inputStr or path\r\
+            elseif p1 == keys.layerUnknown or p1 == keys.esc then \r\
+                -- Cancel input on ESC\r\
+                term.setCursorBlink(false)\r\
+                return nil\r\
+            end\r\
+        end\r\
+    end\r\
+end\r\
+\r\
+-- Operation progress window overlay\r\
+local function showProgressWindow(operation, currentFile, fromPath, toPath)\r\
+    local winW, winH = 36, 7\r\
+    local sx = math.floor((w - winW) / 2)\r\
+    local sy = math.floor((h - winH) / 2)\r\
+    \r\
+    term.setBackgroundColor(colors.gray)\r\
+    for y = sy, sy + winH - 1 do\r\
+        term.setCursorPos(sx, y)\r\
+        term.write(string.rep(\" \", winW))\r\
+    end\r\
+    \r\
+    term.setTextColor(colors.yellow)\r\
+    term.setCursorPos(sx + 2, sy + 1)\r\
+    term.write(\"OPERATION: \" .. operation:upper())\r\
+    \r\
+    term.setTextColor(colors.white)\r\
+    term.setCursorPos(sx + 2, sy + 3)\r\
+    term.write(\"Item: \" .. currentFile:sub(1, winW - 10))\r\
+    \r\
+    if fromPath then\r\
+        term.setCursorPos(sx + 2, sy + 4)\r\
+        term.write(\"From: /\" .. fromPath:sub(1, winW - 10))\r\
+    end\r\
+    if toPath then\r\
+        term.setCursorPos(sx + 2, sy + 5)\r\
+        term.write(\"To:   /\" .. toPath:sub(1, winW - 10))\r\
+    end\r\
+    \r\
+    sleep(0.2) -- Short delay to visualize operation progress\r\
+	term.setBackgroundColor(colors.black)\r\
+end\r\
+\r\
+-- Helper to draw file list inside a single panel\r\
+local function drawPanelList(files, currentDir, startX, mid, isActive, currentSel, selectedTable, offset, scrollX) \r\
+    scrollX = scrollX or 0\r\
+    local maxDisplayedItems = h - 1 -- h - 4\r\
+    local maxVisibleWidth = mid - 3\r\
+\r\
+    for i = 1, maxDisplayedItems do \r\
+        local fileIndex = i + offset \r\
+        local file = files[fileIndex] \r\
+        term.setCursorPos(startX, i + 1) \r\
+\r\
+        if file then \r\
+            local fullPath = fs.combine(currentDir, file) \r\
+            if isActive and fileIndex == currentSel then \r\
+                term.setBackgroundColor(colors.blue) \r\
+            elseif selectedTable[file] then \r\
+                term.setBackgroundColor(colors.green) \r\
+            else \r\
+                term.setBackgroundColor(colors.black) \r\
+            end \r\
+\r\
+            if fs.isDir(fullPath) then \r\
+                term.setTextColor(colors.yellow) \r\
+            else \r\
+                term.setTextColor(colors.white) \r\
+            end \r\
+\r\
+            local displayName = file:sub(1 + scrollX, maxVisibleWidth + scrollX)\r\
+\r\
+            local padding = maxVisibleWidth - #displayName\r\
+            if padding < 0 then padding = 0 end\r\
+\r\
+            term.write(displayName .. string.rep(\" \", padding)) \r\
+        else \r\
+            term.setBackgroundColor(colors.black) \r\
+            term.write(string.rep(\" \", maxVisibleWidth)) \r\
+        end \r\
+    end \r\
+    term.setTextColor(colors.white) \r\
+end\r\
+\r\
+-- Help window overlay\r\
+local function drawHelpWindow()\r\
+    local hw, hh = 36, 11\r\
+    local sx = math.floor((w - hw) / 2)\r\
+    local sy = math.floor((h - hh) / 2)\r\
+    \r\
+    term.setBackgroundColor(colors.gray)\r\
+    for y = sy, sy + hh do term.setCursorPos(sx, y) term.write(string.rep(\" \", hw)) end\r\
+    \r\
+    term.setTextColor(colors.yellow)\r\
+    term.setCursorPos(sx + 15, sy + 0) term.write(\"HELP\")\r\
+    \r\
+    term.setTextColor(colors.white)\r\
+	local step = 1\r\
+    term.setCursorPos(sx + 2, sy + step)  term.write(\"Tab       - Switch panel\") step = step + 1\r\
+    term.setCursorPos(sx + 2, sy + step)  term.write(\"Space     - Select multiple\") step = step + 1\r\
+    term.setCursorPos(sx + 2, sy + step)  term.write(\"Enter     - Open folder/file\") step = step + 1\r\
+	term.setCursorPos(sx + 2, sy + step)  term.write(\"Backspace - Back\") step = step + 1\r\
+	term.setCursorPos(sx + 2, sy + step)  term.write(\"F         - Refresh active panel\") step = step + 1\r\
+	term.setCursorPos(sx + 2, sy + step)  term.write(\"R         - Rename\") step = step + 1\r\
+    term.setCursorPos(sx + 2, sy + step)  term.write(\"C / M     - Copy / Move selected\") step = step + 1\r\
+    --term.setCursorPos(sx + 2, sy + step)  term.write(\"Delete    - Delete selected\") step = step + 1\r\
+	term.setCursorPos(sx + 2, sy + step)  term.write(\"I         - Delete selected\") step = step + 1\r\
+    --term.setCursorPos(sx + 2, sy + step)  term.write(\"F1 / F2   - Create File / Folder\") step = step + 1\r\
+	term.setCursorPos(sx + 2, sy + step)  term.write(\"T / Y     - Create File / Folder\") step = step + 1\r\
+    term.setCursorPos(sx + 2, sy + step)  term.write(\"H / Q     - Toggle Help / Exit\") step = step + 1\r\
+	term.setTextColor(colors.yellow)\r\
+	term.setCursorPos(sx + 6, sy + step)  term.write(\"Commander by vova43 v1.1\")\r\
+	term.setBackgroundColor(colors.black)\r\
+end\r\
+\r\
+-- Function to get the last folder name and truncate it if it exceeds maxLength\r\
+local function getFinalFolderName(path, maxLength)\r\
+    -- If the path is empty, return root symbol or empty string\r\
+    if not path or path == \"\" then\r\
+        return \"\"\r\
+    end\r\
+    -- Extract the substring after the last slash '/'\r\
+    local finalName = path:match(\"([^/]+)$\") or path\r\
+    -- Check if the length exceeds the limit\r\
+    if #finalName > maxLength then\r\
+        -- Calculate how many characters from the end we can keep\r\
+        -- Subtracting 2 to make room for the \"..\" dots\r\
+        local keepLength = maxLength - 2\r\
+        -- Prevent negative lengths or errors on very small limits\r\
+        if keepLength > 0 then\r\
+            finalName = \"..\" .. finalName:sub(#finalName - keepLength + 1)\r\
+        else\r\
+            finalName = finalName:sub(1, maxLength)\r\
+        end\r\
+    end\r\
+    return finalName\r\
+end\r\
+\r\
+-- Main interface rendering loop\r\
+local function draw()\r\
+    term.clear()\r\
+	term.setBackgroundColor(colors.black)\r\
+    local mid = math.floor(w / 2)\r\
+    \r\
+    -- Directory path headers\r\
+    term.setBackgroundColor(colors.gray)\r\
+    term.setCursorPos(1, 1) term.clearLine()\r\
+	term.setCursorPos(2, 1) term.write(getFinalFolderName(leftDir, mid - 4))\r\
+    term.setCursorPos(mid + 2, 1) term.write(getFinalFolderName(rightDir, mid - 4))\r\
+    term.setBackgroundColor(colors.black)\r\
+    \r\
+    -- Panel vertical separator line\r\
+	for y = 2, h - 0 do term.setCursorPos(mid, y) term.write(\"|\") end\r\
+    \r\
+	-- drawPanelList(leftFiles, leftDir, 2, mid, (activePanel == \"left\"), leftSel, leftSelected, leftOffset)\r\
+    -- drawPanelList(rightFiles, rightDir, mid + 2, mid, (activePanel == \"right\"), rightSel, rightSelected, rightOffset)\r\
+	drawPanelList(leftFiles, leftDir, 2, mid, (activePanel == \"left\"), leftSel, leftSelected, leftOffset, leftScrollX)\r\
+    drawPanelList(rightFiles, rightDir, mid + 2, mid, (activePanel == \"right\"), rightSel, rightSelected, rightOffset, rightScrollX)\r\
+    \r\
+    -- Command bar overlay placeholder\r\
+    -- term.setBackgroundColor(colors.gray)\r\
+    -- term.setCursorPos(1, h - 1) term.clearLine()\r\
+    -- term.write(\" F1:NewFile | F2:NewDir | Del:Delete | H:Help\")\r\
+	\r\
+    if showHelp then drawHelpWindow() end\r\
+end\r\
+\r\
+-- Main\r\
+term.clear()\r\
+term.setBackgroundColor(colors.black)\r\
+term.setCursorPos(1, 1)\r\
+\r\
+refreshPanel(\"left\")\r\
+refreshPanel(\"right\")\r\
+\r\
+-- Core listener loop\r\
+while true do\r\
+    draw()\r\
+    local event, key = os.pullEvent(\"key\")\r\
+    \r\
+    if showHelp then\r\
+        if key == keys.h then showHelp = false elseif key == keys.q then break end\r\
+    else\r\
+        if key == keys.q then\r\
+            break\r\
+        elseif key == keys.h then\r\
+            showHelp = true\r\
+        elseif key == keys.tab then\r\
+            activePanel = (activePanel == \"left\") and \"right\" or \"left\"\r\
+		end\r\
+		local success, err = pcall(function()\r\
+			if key == keys.up or key == keys.w then\r\
+				local maxDisplayedItems = h - 4\r\
+				if activePanel == \"left\" and leftSel > 1 then \r\
+					leftSel = leftSel - 1\r\
+					if leftSel <= leftOffset then leftOffset = leftSel - 1 end\r\
+				elseif activePanel == \"right\" and rightSel > 1 then \r\
+					rightSel = rightSel - 1 \r\
+					if rightSel <= rightOffset then rightOffset = rightSel - 1 end\r\
+				end\r\
+			elseif key == keys.down or key == keys.s then\r\
+				local maxDisplayedItems = h - 4\r\
+				if activePanel == \"left\" and leftSel < #leftFiles then \r\
+					leftSel = leftSel + 1\r\
+					if leftSel > leftOffset + maxDisplayedItems then leftOffset = leftSel - maxDisplayedItems end\r\
+				elseif activePanel == \"right\" and rightSel < #rightFiles then \r\
+					rightSel = rightSel + 1 \r\
+					if rightSel > rightOffset + maxDisplayedItems then rightOffset = rightSel - maxDisplayedItems end\r\
+				end\r\
+				\r\
+			elseif key == keys.right then\r\
+				if activePanel == \"left\" then\r\
+					leftScrollX = leftScrollX + 1\r\
+				elseif activePanel == \"right\" then\r\
+					rightScrollX = rightScrollX + 1\r\
+				end\r\
+			elseif key == keys.left then\r\
+				if activePanel == \"left\" then\r\
+					leftScrollX = math.max(0, leftScrollX - 1)\r\
+				elseif activePanel == \"right\" then\r\
+					rightScrollX = math.max(0, rightScrollX - 1)\r\
+				end\r\
+				\r\
+			elseif key == keys.space then\r\
+				local activeFiles = (activePanel == \"left\") and leftFiles or rightFiles\r\
+				local activeSel = (activePanel == \"left\") and leftSel or rightSel\r\
+				local selTable = (activePanel == \"left\") and leftSelected or rightSelected\r\
+				if #activeFiles > 0 then\r\
+					local file = activeFiles[activeSel]\r\
+					if selTable[file] then selTable[file] = nil else selTable[file] = true end\r\
+				end\r\
+				-- Next step\r\
+				-- local maxDisplayedItems = h - 4\r\
+				-- if activePanel == \"left\" and leftSel < #leftFiles then \r\
+					-- leftSel = leftSel + 1\r\
+					-- if leftSel > leftOffset + maxDisplayedItems then leftOffset = leftSel - maxDisplayedItems end\r\
+				-- elseif activePanel == \"right\" and rightSel < #rightFiles then \r\
+					-- rightSel = rightSel + 1 \r\
+					-- if rightSel > rightOffset + maxDisplayedItems then rightOffset = rightSel - maxDisplayedItems end\r\
+				-- end\r\
+			-- Next step\r\
+			elseif key == keys.b then\r\
+				local activeFiles = (activePanel == \"left\") and leftFiles or rightFiles\r\
+				local activeSel = (activePanel == \"left\") and leftSel or rightSel\r\
+				local selTable = (activePanel == \"left\") and leftSelected or rightSelected\r\
+				if #activeFiles > 0 then\r\
+					local file = activeFiles[activeSel]\r\
+					if selTable[file] then selTable[file] = nil else selTable[file] = true end\r\
+				end\r\
+				\r\
+				local maxDisplayedItems = h - 4\r\
+				if activePanel == \"left\" and leftSel < #leftFiles then \r\
+					leftSel = leftSel + 1\r\
+					if leftSel > leftOffset + maxDisplayedItems then leftOffset = leftSel - maxDisplayedItems end\r\
+				elseif activePanel == \"right\" and rightSel < #rightFiles then \r\
+					rightSel = rightSel + 1 \r\
+					if rightSel > rightOffset + maxDisplayedItems then rightOffset = rightSel - maxDisplayedItems end\r\
+				end\r\
+			elseif key == keys.enter then\r\
+				local currentDir = (activePanel == \"left\") and leftDir or rightDir\r\
+				local currentFiles = (activePanel == \"left\") and leftFiles or rightFiles\r\
+				local currentSel = (activePanel == \"left\") and leftSel or rightSel\r\
+				\r\
+				if #currentFiles > 0 then\r\
+					local selected = currentFiles[currentSel]\r\
+					local fullPath = fs.combine(currentDir, selected)\r\
+					\r\
+					if fs.isDir(fullPath) then\r\
+						if activePanel == \"left\" then leftDir = fullPath leftSel = 1 leftOffset = 0 clearSelection(\"left\") refreshPanel(\"left\")\r\
+						else rightDir = fullPath rightSel = 1 rightOffset = 0 clearSelection(\"right\") refreshPanel(\"right\") end\r\
+					else\r\
+						term.clear() term.setCursorPos(1, 1)\r\
+						shell.run(\"edit\", fullPath)\r\
+						refreshPanel(\"left\") refreshPanel(\"right\")\r\
+					end\r\
+				end\r\
+				leftScrollX = 0\r\
+				rightScrollX = 0\r\
+			elseif key == keys.backspace then\r\
+				if activePanel == \"left\" and leftDir ~= \"\" then\r\
+					leftDir = fs.getDir(leftDir) leftSel = 1 leftOffset = 0 clearSelection(\"left\") refreshPanel(\"left\")\r\
+				elseif activePanel == \"right\" and rightDir ~= \"\" then\r\
+					rightDir = fs.getDir(rightDir) rightSel = 1 rightOffset = 0 clearSelection(\"right\") refreshPanel(\"right\")\r\
+				end\r\
+			elseif key == keys.z then\r\
+				local maxDisplayedItems = h - 4\r\
+				if activePanel == \"left\" and leftSel > 10 then \r\
+					leftSel = leftSel - 10\r\
+					if leftSel <= leftOffset then leftOffset = leftSel - 10 end\r\
+					if leftOffset < 0 then leftOffset = 0 end\r\
+				elseif activePanel == \"right\" and rightSel > 10 then \r\
+					rightSel = rightSel - 10\r\
+					if rightSel <= rightOffset then rightOffset = rightSel - 10 end\r\
+					if rightOffset < 0 then rightOffset = 0 end\r\
+				end\r\
+			elseif key == keys.x then\r\
+				local maxDisplayedItems = h - 4\r\
+				if activePanel == \"left\" and leftSel < #leftFiles then \r\
+					leftSel = leftSel + 10\r\
+					if leftSel > leftOffset + maxDisplayedItems then leftOffset = leftSel - maxDisplayedItems end\r\
+				elseif activePanel == \"right\" and rightSel < #rightFiles then \r\
+					rightSel = rightSel + 10 \r\
+					if rightSel > rightOffset + maxDisplayedItems then rightOffset = rightSel - maxDisplayedItems end\r\
+				end\r\
+			elseif key == keys.r then\r\
+				local currentDir = (activePanel == \"left\") and leftDir or rightDir\r\
+				local currentFiles = (activePanel == \"left\") and leftFiles or rightFiles\r\
+				local currentSel = (activePanel == \"left\") and leftSel or rightSel\r\
+				\r\
+				if #currentFiles > 0 then\r\
+					local selected = currentFiles[currentSel]\r\
+					local source = fs.combine(currentDir, selected)\r\
+					\r\
+					local newName = promptInputPath(\"Enter new name:\", selected)\r\
+					if newName and newName ~= selected and newName ~= \"\" then\r\
+						local dest = fs.combine(currentDir, newName)\r\
+						if not fs.exists(dest) then\r\
+							showProgressWindow(\"rename\", selected, source, dest)\r\
+							fs.move(source, dest)\r\
+							refreshPanel(activePanel)\r\
+						end\r\
+					end\r\
+					refreshPanel(activePanel)\r\
+				end\r\
+			--elseif key == keys.f1 then\r\
+			elseif key == keys.t then\r\
+				local name = promptInput(\"Enter new file name:\")\r\
+				if name then\r\
+					local currentDir = (activePanel == \"left\") and leftDir or rightDir\r\
+					local fullPath = fs.combine(currentDir, name)\r\
+					term.clear() term.setCursorPos(1, 1)\r\
+					shell.run(\"edit\", fullPath)\r\
+					refreshPanel(activePanel)\r\
+				end\r\
+			--elseif key == keys.f2 then\r\
+			elseif key == keys.y then\r\
+				local name = promptInput(\"Enter new folder name:\")\r\
+				if name then\r\
+					local currentDir = (activePanel == \"left\") and leftDir or rightDir\r\
+					fs.makeDir(fs.combine(currentDir, name))\r\
+					refreshPanel(activePanel)\r\
+				end\r\
+			--elseif key == keys.delete then\r\
+			elseif key == keys.i then\r\
+				local srcDir = (activePanel == \"left\") and leftDir or rightDir\r\
+				local srcFiles = (activePanel == \"left\") and leftFiles or rightFiles\r\
+				local srcSel = (activePanel == \"left\") and leftSel or rightSel\r\
+				local selTable = (activePanel == \"left\") and leftSelected or rightSelected\r\
+				\r\
+				local targets = {}\r\
+				if getSelectedCount(selTable) > 0 then\r\
+					--\r\
+					for file in pairs(selTable) do table.insert(targets, file) end\r\
+				elseif #srcFiles > 0 then\r\
+					table.insert(targets, srcFiles[srcSel])\r\
+				end\r\
+				\r\
+				for _, file in ipairs(targets) do\r\
+					local fullPath = fs.combine(srcDir, file)\r\
+					showProgressWindow(\"delete\", file, fullPath, nil)\r\
+					fs.delete(fullPath)\r\
+				end\r\
+				clearSelection(activePanel)\r\
+				refreshPanel(\"left\") refreshPanel(\"right\")\r\
+			elseif key == keys.f then\r\
+				refreshPanel(activePanel)\r\
+			elseif key == keys.c or key == keys.m then\r\
+				local isMove = (key == keys.m)\r\
+				local opName = isMove and \"move\" or \"copy\"\r\
+				\r\
+				local srcDir = (activePanel == \"left\") and leftDir or rightDir\r\
+				local dstDirS = (activePanel == \"left\") and rightDir or leftDir\r\
+				\r\
+				local srcFiles = (activePanel == \"left\") and leftFiles or rightFiles\r\
+				local srcSel = (activePanel == \"left\") and leftSel or rightSel\r\
+				local selTable = (activePanel == \"left\") and leftSelected or rightSelected\r\
+				\r\
+				local dstDir = promptInputPath(\"Enter new path:\", dstDirS)\r\
+				if dstDir then\r\
+					local targets = {}\r\
+					if getSelectedCount(selTable) > 0 then\r\
+						for file in pairs(selTable) do table.insert(targets, file) end\r\
+					elseif #srcFiles > 0 then\r\
+						table.insert(targets, srcFiles[srcSel])\r\
+					end\r\
+					for _, file in ipairs(targets) do\r\
+						local source = fs.combine(srcDir, file)\r\
+						local dest = fs.combine(dstDir, file)\r\
+						if not fs.exists(dest) then\r\
+							showProgressWindow(opName, file, source, dest)\r\
+							if isMove then fs.move(source, dest) else fs.copy(source, dest) end\r\
+						end\r\
+					end\r\
+				end\r\
+				clearSelection(activePanel)\r\
+				refreshPanel(\"left\") refreshPanel(\"right\")\r\
+			end\r\
+		end)\r\
+		\r\
+		if not success then\r\
+			term.clear()\r\
+			term.setCursorPos(1,1)\r\
+			print(\"\" .. tostring(err))\r\
+			local errorm = tostring(err):match(\"([^:]+)$\") or tostring(err)\r\
+            errorm = errorm:match(\"^%s*(.-)%s*$\")\r\
+			print(\"Error: \" .. errorm)\r\
+			print(\"Press Enter to continue...\")\r\
+			read()\r\
+			draw()\r\
+		end\r\
+	end\r\
+end\r\
+clearEvent()\r\
+term.clear()\r\
+term.setCursorPos(1,1)",
+  [ "temp/file_archive/backup_x.lua" ] = "--[[\r\
+local args = { ... }\r\
+local path = args[1]\r\
+local path1 = args[2] or path\r\
+local name = args[2]\r\
+\r\
+if not path then\r\
+    print(\"Usage: backup_x <path> <to path> <name>\")\r\
+    return\r\
+end\r\
+\r\
+-- Функция для URL-кодирования (необходима для отправки данных)\r\
+local function urlEncode(str)\r\
+    if str then\r\
+        str = str:gsub(\"\\n\", \"\\r\\n\")\r\
+        str = str:gsub(\"([^%w %-%_%.%~])\", function(c)\r\
+            return string.format(\"%%%02X\", string.byte(c))\r\
+        end)\r\
+        str = str:gsub(\" \", \"+\")\r\
+    end\r\
+    return str\r\
+end\r\
+\r\
+local archive = {}\r\
+\r\
+-- Функция рекурсивного обхода всех папок и файлов\r\
+local function scanDirectory(dir)\r\
+    local list = fs.list(dir)\r\
+    for _, item in ipairs(list) do\r\
+        local path = fs.combine(dir, item)\r\
+        \r\
+        if fs.isDir(path) then\r\
+			scanDirectory(path) -- Если папка, заходим внутрь\r\
+		else\r\
+			-- Если файл, читаем его содержимое\r\
+			local f = fs.open(path, \"r\")\r\
+			if f then\r\
+				archive[path] = f.readAll()\r\
+				f.close()\r\
+				print(\"Packed: \" .. path)\r\
+			end\r\
+		end\r\
+    end\r\
+end\r\
+\r\
+local function runBackup(path, path1)\r\
+    print(\"Scanning and packing files...\")\r\
+    scanDirectory(path)\r\
+\r\
+    -- Сериализуем (превращаем таблицу в текст)\r\
+    local serializedData = textutils.serialize(archive)\r\
+	\r\
+	\r\
+	\r\
+	--local finalName = name or path:match(\"([^/]+)$\")\r\
+    \r\
+    print(\"\\n[SUCCESS] Archive create!\")\r\
+	--local log = fs.open(path1 .. \"/\" .. finalName .. \".txt\", \"w\")\r\
+	--print(finalName)\r\
+	--print(string.format(\"%s/%s.txt\", path1, finalName))\r\
+	\r\
+	\r\
+	\r\
+	--local log = fs.open(string.format(\"%s/%s.txt\", path1, finalName), \"w\")\r\
+	--log.write(serializedData)\r\
+	--log.close()\r\
+end\r\
+\r\
+runBackup(path, path1)\r\
+]]\r\
+\r\
+local args = { ... }\r\
+local path = args[1]\r\
+local path1 = args[2] or path\r\
+local name = args[3]\r\
+\r\
+if not path then\r\
+    print(\"Usage: backup_x <path> <to path>\")\r\
+    return\r\
+end\r\
+\r\
+-- if not path1 then\r\
+    -- print(\"Usage: backup_x <path> <to path>\")\r\
+    -- return\r\
+-- end\r\
+\r\
+-- Функция для URL-кодирования (необходима для отправки данных)\r\
+local function urlEncode(str)\r\
+    if str then\r\
+        str = str:gsub(\"\\n\", \"\\r\\n\")\r\
+        str = str:gsub(\"([^%w %-%_%.%~])\", function(c)\r\
+            return string.format(\"%%%02X\", string.byte(c))\r\
+        end)\r\
+        str = str:gsub(\" \", \"+\")\r\
+    end\r\
+    return str\r\
+end\r\
+\r\
+local archive = {}\r\
+\r\
+-- Функция рекурсивного обхода всех папок и файлов\r\
+local function scanDirectory(dir)\r\
+	if fs.isDir(dir) then\r\
+		local list = fs.list(dir)\r\
+		for _, item in ipairs(list) do\r\
+			local path = fs.combine(dir, item)\r\
+			\r\
+			if fs.isDir(path) then\r\
+				scanDirectory(path) -- Если папка, заходим внутрь\r\
+			else\r\
+				-- Если файл, читаем его содержимое\r\
+				local f = fs.open(path, \"r\")\r\
+				if f then\r\
+					archive[path] = f.readAll()\r\
+					f.close()\r\
+					print(\"Packed: \" .. path)\r\
+				end\r\
+			end\r\
+		end\r\
+		return 1\r\
+	else\r\
+		print(string.format(\"Error: %s not a directory\", dir))\r\
+		return 0\r\
+	end\r\
+end\r\
+\r\
+local function runBackup(path, path1)\r\
+    print(\"Scanning and packing files...\")\r\
+    local ok = scanDirectory(path)\r\
+	\r\
+	if ok == 0 then\r\
+		return\r\
+	end\r\
+\r\
+    -- Сериализуем (превращаем таблицу в текст)\r\
+    local serializedData = textutils.serialize(archive)\r\
+    \r\
+    print(\"\\n[SUCCESS] Archive create!\")\r\
+	local finalName = name or path:match(\"([^/]+)$\")\r\
+	print(\"Name: \" .. finalName)\r\
+	--print(\"Path: \" .. path1)\r\
+	local finalArchivePath = string.format(\"%s%s.txt\", path1, finalName)\r\
+	print(\"Path: \" .. finalArchivePath)\r\
+	\r\
+	local log = fs.open(finalArchivePath, \"w\")\r\
+	log.write(serializedData)\r\
+	log.close()\r\
+end\r\
+\r\
+runBackup(path, path1)\r\
+",
+  [ "temp/file_archive/restore_x.lua" ] = "local args = { ... }\r\
+local path = args[1]\r\
+local pathOut = args[2] or \"/\"\r\
+\r\
+if not path then\r\
+    print(\"Usage: restore <path> <to path>\")\r\
+    return\r\
+end\r\
+\r\
+local f = fs.open(path, \"r\")\r\
+if f then	\r\
+	print(\"Unpacking data...\")\r\
+	local archive = textutils.unserialize(f.readAll())\r\
+	f.close()\r\
+\r\
+	if type(archive) ~= \"table\" then\r\
+		printError(\"Error: Invalid archive format.\")\r\
+		return\r\
+	end\r\
+\r\
+	-- Восстанавливаем файлы\r\
+	for path, data in pairs(archive) do\r\
+		path = fs.combine(pathOut, path)\r\
+		-- Если файл лежал в папке, создаем эту папку, если её нет\r\
+		local dir = fs.getDir(path)\r\
+		if dir ~= \"\" and not fs.exists(dir) then\r\
+			fs.makeDir(dir)\r\
+		end\r\
+\r\
+		-- Записываем данные в файл\r\
+		local f = fs.open(path, \"w\")\r\
+		if f then\r\
+			f.write(data)\r\
+			f.close()\r\
+			print(\"Restored: \" .. path)\r\
+		end\r\
+	end\r\
+\r\
+	print(\"\\n[DONE] All files restored successfully!\")\r\
+end\r\
+",
+  [ "temp/file_archive/backup_x_.lua" ] = "local args = { ... }\r\
+local path = args[1]\r\
+local path1 = args[2]\r\
+\r\
+if not path then\r\
+    print(\"Usage: backup_x <path> <to path>\")\r\
+    return\r\
+end\r\
+\r\
+if not path1 then\r\
+    print(\"Usage: backup_x <path> <to path>\")\r\
+    return\r\
+end\r\
+\r\
+-- Функция для URL-кодирования (необходима для отправки данных)\r\
+local function urlEncode(str)\r\
+    if str then\r\
+        str = str:gsub(\"\\n\", \"\\r\\n\")\r\
+        str = str:gsub(\"([^%w %-%_%.%~])\", function(c)\r\
+            return string.format(\"%%%02X\", string.byte(c))\r\
+        end)\r\
+        str = str:gsub(\" \", \"+\")\r\
+    end\r\
+    return str\r\
+end\r\
+\r\
+local archive = {}\r\
+\r\
+-- Функция рекурсивного обхода всех папок и файлов\r\
+local function scanDirectory(dir)\r\
+    local list = fs.list(dir)\r\
+    for _, item in ipairs(list) do\r\
+        local path = fs.combine(dir, item)\r\
+        \r\
+        if fs.isDir(path) then\r\
+			scanDirectory(path) -- Если папка, заходим внутрь\r\
+		else\r\
+			-- Если файл, читаем его содержимое\r\
+			local f = fs.open(path, \"r\")\r\
+			if f then\r\
+				archive[path] = f.readAll()\r\
+				f.close()\r\
+				print(\"Packed: \" .. path)\r\
+			end\r\
+		end\r\
+    end\r\
+end\r\
+\r\
+local function runBackup(path, path1)\r\
+    print(\"Scanning and packing files...\")\r\
+    scanDirectory(path)\r\
+\r\
+    -- Сериализуем (превращаем таблицу в текст)\r\
+    local serializedData = textutils.serialize(archive)\r\
+    \r\
+    print(\"\\n[SUCCESS] Archive create!\")\r\
+	local log = fs.open(path1 .. \"/archive.txt\", \"w\")\r\
+	log.write(serializedData)\r\
+	log.close()\r\
+end\r\
+\r\
+runBackup(path, path1)\r\
+",
+}
